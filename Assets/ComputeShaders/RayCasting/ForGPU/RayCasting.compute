@@ -1,0 +1,245 @@
+﻿// This is where we specify the entry function name.
+// Once you dispatch the compute shader it will run function "main"
+// on GPU.
+
+// Shader still could be optimaized much better, for the core purpose, because some of code
+// causes code forking that reduces performance extremly.
+
+#pragma kernel main
+//#pragma enable_d3d11_debug_symbols
+
+/* These are the data structures that will be used with our resources */
+
+// Every vertex is described this way.
+struct VertexData
+{
+	float3 position;
+	float3 normal;
+	float2 uv;
+};
+
+// Every triangle.
+struct TriangleData
+{
+	uint vertexIndex0;
+	uint vertexIndex1;
+	uint vertexIndex2;
+};
+
+// Every body in the scene that is tracked.
+struct BodyData
+{
+	uint diffuseTextureIndex;
+	uint meshDataIndex;
+};
+
+// Every mesh, but only the unique ones.
+struct MeshData
+{
+	uint triangleIndexStart;
+	uint triangleIndexCount;
+};
+
+// Every ray, it size will same as the numbers of total threads.
+struct RayData
+{
+	float3 position; // Yea I know it usually called origin.
+	float3 direction;
+};
+
+struct RayHitData
+{
+	VertexData hitPoint;
+	float hitDistance;
+	bool isHit;
+};
+
+// _______________________________________
+// || THIS IS WHERE OUR RESOURCES START ||
+// _______________________________________
+
+// And this is the actual data that we can access.
+// RWStructuredBuffer - the meaning of this veriable:
+// --------------------------------------------------
+// RW - read and write.
+// Structured - it allows us to use structs as data, in other case we would be bound to use only "int, uint, float, float3, ..."
+// Buffer - means what it is, the buffer.
+RWStructuredBuffer<VertexData> vertexDataBuffer;
+RWStructuredBuffer<TriangleData> triangleDataBuffer;
+RWStructuredBuffer<BodyData> bodyDataBuffer;
+RWStructuredBuffer<MeshData> meshDataBuffer;
+RWStructuredBuffer<RayData> rayDataBuffer;
+
+RWTexture2D<float4> renderTarget;
+
+// Screen resolution;
+int width;
+int height;
+
+uint bodyDataCount; // Describes how much bodies buffer "bodyDataBuffer" has.
+float4 backgroundColor; // Background color that will be used, if ray misses.
+
+// ______________________________________
+// || THIS IS WHERE OUR RESOURCES ENDS ||
+// ______________________________________
+
+// Tests ray and triangle intersection, in case of hit returns distance and barycentricCoordinates.
+// https://en.wikipedia.org/wiki/Barycentric_coordinate_system
+// Barycentric coordinates - in this case is vector3, x describes how much hit point is near the vertex1,
+// y describes how much hit point is near the vertex2 and so on.
+// Barycentric coordinates sum of values is always 1. 
+// You can imagine Barycentric coordinates as bone skinning, where bones are triangle vertices and coordinates are the bone weights.
+bool intersectRayTriangle(RayData ray, VertexData vertex0, VertexData vertex1, VertexData vertex2,
+	out float distance, out float3 barycentricCoordinates)
+{
+	float3 v0 = vertex0.position;
+	float3 v1 = vertex1.position;
+	float3 v2 = vertex2.position;
+
+	float3 ab = v1 - v0;
+	float3 ac = v2 - v0;
+
+	// Compute triangle normal. Can be precalculated or cached if
+	// intersecting multiple segments against the same triangle
+	float3 n = cross(ab, ac);
+
+	// Compute denominator d. If d <= 0, segment is parallel to or points
+	// away from triangle, so exit early
+	float d = dot(-ray.direction, n);
+	if (abs(d) <= 0.0f)
+		return false;
+
+	// Compute intersection t value of pq with plane of triangle. A ray
+	// intersects iff 0 <= t. Segment intersects iff 0 <= t <= 1. Delay
+	// dividing by d until intersection has been found to pierce triangle
+	float3 ap = ray.position - v0;
+	float t = dot(ap, n);
+	if ((t < 0.0f))
+		return false;
+
+	// Compute barycentric coordinate components and test if within bounds
+	float3 e = cross(-ray.direction, ap);
+	float v = dot(ac, e);
+	if (v < 0.0f || v > d)
+		return false;
+
+	float w = -dot(ab, e);
+	if (w < 0.0f || v + w > d)
+		return false;
+
+	// Segment/ray intersects triangle. Perform delayed division and
+	// compute the last barycentric coordinate component
+	float ood = 1.0f / d;
+	t *= ood;
+	v *= ood;
+	w *= ood;
+	float u = 1.0f - v - w;
+
+	distance = t;
+	barycentricCoordinates = float3(u, v, w);
+
+	return t;
+}
+
+// The function that calculates hit point with supplied values.
+RayHitData rayIntersectTriangle(RayData ray, VertexData vertex0, VertexData vertex1, VertexData vertex2)
+{
+	VertexData hitPoint;
+	hitPoint.position = float3(0, 0, 0);
+	hitPoint.normal = float3(0, 0, 0);
+	hitPoint.uv = float2(0, 0);
+
+	RayHitData rayHitData;
+
+	float distance = 0;
+	float3 barycentricCoordinated = 0;
+	bool isHit = intersectRayTriangle(ray, vertex0, vertex1, vertex2, distance, barycentricCoordinated);
+	
+	if (isHit)
+	{
+		rayHitData.hitDistance = distance;
+		rayHitData.isHit = true;
+		hitPoint.position = ray.position + ray.direction * distance;
+		hitPoint.normal = barycentricCoordinated.x * vertex0.normal + barycentricCoordinated.y * vertex1.normal
+			+ barycentricCoordinated.z * vertex2.normal;
+		hitPoint.uv = barycentricCoordinated.x * vertex0.uv + barycentricCoordinated.y * vertex1.uv
+			+ barycentricCoordinated.z * vertex2.uv;
+	}
+	else
+	{
+		// We still need to return something so in this case we set them to default values.
+		rayHitData.isHit = false;
+		rayHitData.hitDistance = 0;
+		
+	}
+	rayHitData.hitPoint = hitPoint;
+	return rayHitData;
+}
+
+// This function is used to calculate the final color that should be pixel lit.
+float4 calculateFinalColor(BodyData body, VertexData hitPoint)
+{
+	float4 finalColor = float4(0, 0, 0, 1);
+
+	float3 diffuseColor = float3(1, 1, 1) * dot(hitPoint.normal, float3(-0.7, 0, -0.7));
+	finalColor.rgb += diffuseColor.rgb;
+
+	return finalColor;
+}
+
+// This part specifies how much threads per thead group it should dispatch with function "main".
+// In this case we have 16x16x1 = 256 function "main" calls.
+
+// So for example if we call:
+// ComputeShader.Dispatch(kernelIndexOfMain, 10, 10, 10);
+// As mentioned before we have "threads per group" = 16x16x1 = 256.
+// And with "[numthreads(16, 16, 1)]" we have "thread group count" = 10x10x10 = 1000.
+// So in total we call "main" function "threads per group" * "thread group count" = 256 * 1000 = 256000.
+
+// So you probably now wondering why the thread counts got dimensions, its really means basically nothing
+// and its only used for easier and faster mapping data to threads.
+// For example if have texture 256x256, its more intuitive to call total of threads X=256, Y=256 and not just X=256*256.
+[numthreads(32, 32, 1)]
+
+// This is our function entry. Remember the name is same we specified in "#pragma kernel main"
+// For more info check this https://msdn.microsoft.com/en-us/library/windows/desktop/ff471442(v=vs.85).aspx.
+void main(uint3 id : SV_DispatchThreadID)
+{
+	// Firstly lets find out the ray we are using for this thread.
+	RayData rayData = rayDataBuffer[(id.y) * width + id.x];
+	//rayData.position += float4(0, 0, 0, 0);
+
+	float bestHitDistance = 99999999.0;
+	float4 finalColor = backgroundColor;
+
+	// When as the ray casting states we iterate threw all the objects.
+	// In real use case we would use the spatial paritioning, but for the sake
+	// of simplcity lets keep it this way.
+	for (uint bodyDataIndex = 0; bodyDataIndex < bodyDataCount; bodyDataIndex++)
+	{
+		BodyData bodyData = bodyDataBuffer[bodyDataIndex];
+		MeshData meshData = meshDataBuffer[bodyData.meshDataIndex];
+
+		for (uint triangleIndex = meshData.triangleIndexStart; triangleIndex < meshData.triangleIndexCount; triangleIndex++)
+		{
+			TriangleData triangleData = triangleDataBuffer[triangleIndex];
+
+			VertexData vertexDatas[3];
+			vertexDatas[0] = vertexDataBuffer[triangleData.vertexIndex0];
+			vertexDatas[1] = vertexDataBuffer[triangleData.vertexIndex1];
+			vertexDatas[2] = vertexDataBuffer[triangleData.vertexIndex2];
+
+			RayHitData rayHitData = rayIntersectTriangle(rayData, vertexDatas[0], vertexDatas[1], vertexDatas[2]);
+
+			// Check if we hit the triangle and the distance is smaller.
+			if (rayHitData.isHit && rayHitData.hitDistance < bestHitDistance)
+			{
+				bestHitDistance = rayHitData.hitDistance;
+				finalColor = calculateFinalColor(bodyData, rayHitData.hitPoint);
+			}
+		}
+	}
+
+	// Final output to texture.
+	renderTarget[id.xy] = finalColor;
+}
